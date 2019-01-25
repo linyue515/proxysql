@@ -26,7 +26,11 @@ mysql_status(short event, short cont) {
 // Defining list of session variables for comparison with query digest to disable multiplexing for "SET <variable_name>" commands
 static char * session_vars[]= {
 	// For issue #555 , multiplexing is disabled if --safe-updates is used
-	(char *)"SQL_SAFE_UPDATES=?,SQL_SELECT_LIMIT=?,MAX_JOIN_SIZE=?",
+	//(char *)"SQL_SAFE_UPDATES=?,SQL_SELECT_LIMIT=?,MAX_JOIN_SIZE=?",
+	// for issue #1832 , we are splitting the above into 3 variables
+	(char *)"SQL_SAFE_UPDATES",
+	(char *)"SQL_SELECT_LIMIT",
+	(char *)"MAX_JOIN_SIZE",
 	(char *)"FOREIGN_KEY_CHECKS",
 	(char *)"UNIQUE_CHECKS",
 	(char *)"AUTO_INCREMENT_INCREMENT",
@@ -39,11 +43,13 @@ MySQL_Connection_userinfo::MySQL_Connection_userinfo() {
 	password=NULL;
 	sha1_pass=NULL;
 	schemaname=NULL;
+	fe_username=NULL;
 	hash=0;
 }
 
 MySQL_Connection_userinfo::~MySQL_Connection_userinfo() {
 	if (username) free(username);
+	if (fe_username) free(fe_username);
 	if (password) free(password);
 	if (sha1_pass) free(sha1_pass);
 	if (schemaname) free(schemaname);
@@ -190,6 +196,7 @@ MySQL_Connection::MySQL_Connection() {
 	userinfo=new MySQL_Connection_userinfo();
 	fd=-1;
 	status_flags=0;
+	last_time_used=0;
 	options.client_flag = 0;
 	options.compression_min_length=0;
 	options.server_version=NULL;
@@ -215,6 +222,7 @@ MySQL_Connection::MySQL_Connection() {
 	MyRS_reuse=NULL;
 	unknown_transaction_status = false;
 	creation_time=0;
+	auto_increment_delay_token = 0;
 	processing_multi_statement=false;
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 4, "Creating new MySQL_Connection %p\n", this);
 	local_stmts=new MySQL_STMTs_local_v14(false); // false by default, it is a backend
@@ -1622,6 +1630,7 @@ bool MySQL_Connection::MultiplexDisabled() {
 	if (status_flags & (STATUS_MYSQL_CONNECTION_TRANSACTION|STATUS_MYSQL_CONNECTION_USER_VARIABLE|STATUS_MYSQL_CONNECTION_PREPARED_STATEMENT|STATUS_MYSQL_CONNECTION_LOCK_TABLES|STATUS_MYSQL_CONNECTION_TEMPORARY_TABLE|STATUS_MYSQL_CONNECTION_GET_LOCK|STATUS_MYSQL_CONNECTION_NO_MULTIPLEX|STATUS_MYSQL_CONNECTION_SQL_LOG_BIN0|STATUS_MYSQL_CONNECTION_FOUND_ROWS) ) {
 		ret=true;
 	}
+	if (auto_increment_delay_token) return true;
 	return ret;
 }
 

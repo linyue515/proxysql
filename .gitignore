@@ -50,6 +50,9 @@ binaries/*deb
 binaries/*rpm
 tools/eventslog_reader_sample
 
+proxysql-2.0.0/
+docker/images/proxysql/rhel-compliant/rpmmacros
+
 #core
 core
 
@@ -95,6 +98,7 @@ deps/memcached/memcached-1.4.20/
 
 #libconfig
 deps/libconfig/libconfig-1.4.9/
+deps/libconfig/libconfig-1.7.2/
 
 #libmicrohttpd
 deps/libmicrohttpd/libmicrohttpd-0.9.55/

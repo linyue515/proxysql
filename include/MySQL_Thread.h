@@ -35,6 +35,17 @@ typedef struct __attribute__((aligned(CACHE_LINE_SIZE))) _conn_exchange_t {
 } conn_exchange_t;
 #endif // IDLE_THREADS
 
+typedef struct _thr_id_username_t {
+	uint32_t id;
+	char *username;
+} thr_id_usr;
+
+typedef struct _kill_queue_t {
+	pthread_mutex_t m;
+	std::vector<thr_id_usr *> conn_ids;
+	std::vector<thr_id_usr *> query_ids;
+} kill_queue_t;
+
 class ProxySQL_Poll {
 
   private:
@@ -198,6 +209,7 @@ class MySQL_Thread
 
 	int pipefd[2];
 	int shutdown;
+	kill_queue_t kq;
 
 	bool epoll_thread;
 	bool poll_timeout_bool;
@@ -265,6 +277,8 @@ class MySQL_Thread
 	MySQL_Connection * get_MyConn_local(unsigned int, MySQL_Session *sess, char *gtid_uuid, uint64_t gtid_trxid);
 	void push_MyConn_local(MySQL_Connection *);
 	void return_local_connections();
+	void Scan_Sessions_to_Kill(PtrArray *mysess);
+	void Scan_Sessions_to_Kill_All();
 };
 
 
@@ -368,6 +382,8 @@ class MySQL_Threads_Handler
 		bool commands_stats;
 		bool query_digests;
 		bool query_digests_lowercase;
+		bool query_digests_normalize_digest_text;
+		bool query_digests_track_hostname;
 		bool default_reconnect;
 		bool have_compress;
 		bool have_ssl;
@@ -400,16 +416,18 @@ class MySQL_Threads_Handler
 		int query_processor_iterations;
 		int query_processor_regex;
 		int reset_connection_algorithm;
+		int auto_increment_delay_multiplex;
 		int long_query_time;
 		int hostgroup_manager_verbose;
 		int binlog_reader_connect_retry_msec;
 		char *init_connect;
+		char *add_ldap_user_comment;
 		char *default_sql_mode;
 		char *default_time_zone;
 #ifdef DEBUG
 		bool session_debug;
 #endif /* DEBUG */
-		uint16_t server_capabilities;
+		uint32_t server_capabilities;
 		int poll_timeout;
 		int poll_timeout_on_failure;
 		int connpoll_reset_queue_length;
@@ -449,7 +467,7 @@ class MySQL_Threads_Handler
 	char *get_variable_string(char *name);
 	uint8_t get_variable_uint8(char *name);
 	uint16_t get_variable_uint16(char *name);
-	int get_variable_int(char *name);
+	int get_variable_int(const char *name);
 	void print_version();
 	void init(unsigned int num=0, size_t stack=0);
 	proxysql_mysql_thread_t *create_thread(unsigned int tn, void *(*start_routine) (void *), bool);
@@ -501,6 +519,7 @@ class MySQL_Threads_Handler
 		return MLM->find_iface_from_fd(fd);
 	}
 	void Get_Memory_Stats();
+	void kill_connection_or_query(uint32_t _thread_session_id, bool query, char *username);
 };
 
 

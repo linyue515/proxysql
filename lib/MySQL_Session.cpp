@@ -9,6 +9,8 @@
 #define SELECT_VERSION_COMMENT_LEN 32
 #define PROXYSQL_VERSION_COMMENT "\x01\x00\x00\x01\x01\x27\x00\x00\x02\x03\x64\x65\x66\x00\x00\x00\x11\x40\x40\x76\x65\x72\x73\x69\x6f\x6e\x5f\x63\x6f\x6d\x6d\x65\x6e\x74\x00\x0c\x21\x00\x18\x00\x00\x00\xfd\x00\x00\x1f\x00\x00\x05\x00\x00\x03\xfe\x00\x00\x02\x00\x0b\x00\x00\x04\x0a(ProxySQL)\x05\x00\x00\x05\xfe\x00\x00\x02\x00"
 #define PROXYSQL_VERSION_COMMENT_LEN 81
+#define SELECT_CONNECTION_ID "SELECT CONNECTION_ID()"
+#define SELECT_CONNECTION_ID_LEN 22
 #define SELECT_LAST_INSERT_ID "SELECT LAST_INSERT_ID()"
 #define SELECT_LAST_INSERT_ID_LEN 23
 #define SELECT_LAST_INSERT_ID_LIMIT1 "SELECT LAST_INSERT_ID() LIMIT 1"
@@ -20,6 +22,7 @@ extern const MARIADB_CHARSET_INFO * proxysql_find_charset_name(const char * cons
 extern MARIADB_CHARSET_INFO * proxysql_find_charset_collate_names(const char *csname, const char *collatename);
 
 extern MySQL_Authentication *GloMyAuth;
+extern MySQL_LDAP_Authentication *GloMyLdapAuth;
 extern ProxySQL_Admin *GloAdmin;
 extern MySQL_Logger *GloMyLogger;
 extern MySQL_STMT_Manager_v14 *GloMyStmt;
@@ -332,6 +335,7 @@ MySQL_Session::MySQL_Session() {
 	last_insert_id=0; // #1093
 
 	last_HG_affected_rows = -1; // #1421 : advanced support for LAST_INSERT_ID()
+	ldap_ctx = NULL;
 }
 
 void MySQL_Session::init() {
@@ -407,6 +411,10 @@ MySQL_Session::~MySQL_Session() {
 	}
 	if (mirror) {
 		__sync_sub_and_fetch(&GloMTH->status_variables.mirror_sessions_current,1);
+	}
+	if (ldap_ctx) {
+		GloMyLdapAuth->ldap_ctx_free(ldap_ctx);
+		ldap_ctx = NULL;
 	}
 }
 
@@ -588,8 +596,33 @@ bool MySQL_Session::handler_CommitRollback(PtrSize_t *pkt) {
 // FIXME: This function is currently disabled . See #469
 bool MySQL_Session::handler_SetAutocommit(PtrSize_t *pkt) {
 	size_t sal=strlen("set autocommit");
+	char * _ptr = (char *)pkt->ptr;
 	if ( pkt->size >= 7+sal) {
+		if (strncasecmp((char *)"SET @@session.autocommit",(char *)pkt->ptr+5,strlen((char *)"SET @@session.autocommit"))==0) {
+			memmove(_ptr+9, _ptr+19, pkt->size - 19);
+			memset(_ptr+pkt->size-10,' ',10);
+		}
 		if (strncasecmp((char *)"set autocommit",(char *)pkt->ptr+5,sal)==0) {
+			void *p = NULL;
+			for (int i=5+sal; i < (int)pkt->size; i++) {
+				*((char *)pkt->ptr+i) = tolower(*((char *)pkt->ptr+i));
+			}
+			p = memmem(_ptr+5+sal, pkt->size-5-sal, (void *)"false", 5);
+			if (p) {
+				memcpy(p,(void *)"0    ",5);
+			}
+			p = memmem(_ptr+5+sal, pkt->size-5-sal, (void *)"true", 4);
+			if (p) {
+				memcpy(p,(void *)"1   ",4);
+			}
+			p = memmem(_ptr+5+sal, pkt->size-5-sal, (void *)"off", 3);
+			if (p) {
+				memcpy(p,(void *)"0  ",3);
+			}
+			p = memmem(_ptr+5+sal, pkt->size-5-sal, (void *)"on", 2);
+			if (p) {
+				memcpy(p,(void *)"1 ",2);
+			}
 			__sync_fetch_and_add(&MyHGM->status.autocommit_cnt, 1);
 			unsigned int i;
 			bool eq=false;
@@ -1099,7 +1132,10 @@ void MySQL_Session::handler_again___new_thread_to_kill_connection() {
 			pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 			pthread_attr_setstacksize (&attr, 256*1024);
 			pthread_t pt;
-			pthread_create(&pt, &attr, &kill_query_thread, ka);
+			if (pthread_create(&pt, &attr, &kill_query_thread, ka) != 0) {
+				proxy_error("Thread creation\n");
+				assert(0);
+			}
 		}
 	}
 }
@@ -1316,6 +1352,24 @@ bool MySQL_Session::handler_again___verify_backend_autocommit() {
 			}
 			NEXT_IMMEDIATE_NEW(CHANGING_AUTOCOMMIT);
 		}
+	} else {
+		if (autocommit == false) { // also IsAutoCommit==false
+			if (mysql_thread___enforce_autocommit_on_reads == false) {
+				if (mybe->server_myds->myconn->IsActiveTransaction() == false) {
+					if (CurrentQuery.is_select_NOT_for_update()==true) {
+						// client wants autocommit=0
+						// enforce_autocommit_on_reads=false
+						// there is no transaction
+						// this seems to be the first query, and a SELECT not FOR UPDATE
+						// we will switch back to autcommit=1
+						if (status == PROCESSING_QUERY) {
+							previous_status.push(PROCESSING_QUERY);
+							NEXT_IMMEDIATE_NEW(CHANGING_AUTOCOMMIT);
+						}
+					}
+				}
+			}
+		}
 	}
 	return false;
 }
@@ -1377,6 +1431,7 @@ bool MySQL_Session::handler_again___status_SETTING_INIT_CONNECT(int *_rc) {
 	int rc=myconn->async_send_simple_command(myds->revents,myconn->options.init_connect,strlen(myconn->options.init_connect));
 	if (rc==0) {
 		myds->revents|=POLLOUT;	// we also set again POLLOUT to send a query immediately!
+		myds->free_mysql_real_query();
 		st=previous_status.top();
 		previous_status.pop();
 		NEXT_IMMEDIATE_NEW(st);
@@ -1510,12 +1565,11 @@ bool MySQL_Session::handler_again___status_SETTING_SQL_MODE(int *_rc) {
 	unsigned long query_length=0;
 	if (myconn->async_state_machine==ASYNC_IDLE) {
 		char *q=NULL;
+		q=(char *)"SET SQL_MODE='%s'";
 		if (strlen(myconn->options.sql_mode) > 6) {
 			if (strncasecmp(myconn->options.sql_mode,(char *)"CONCAT",6)==0) {
 				q=(char *)"SET SQL_MODE=%s";
 			}
-		} else {
-			q=(char *)"SET SQL_MODE='%s'";
 		}
 		query=(char *)malloc(strlen(q)+strlen(myconn->options.sql_mode));
 		sprintf(query,q,myconn->options.sql_mode);
@@ -1946,6 +2000,9 @@ bool MySQL_Session::handler_again___status_CHANGING_CHARSET(int *_rc) {
 			// the command failed
 			int myerr=mysql_errno(myconn->mysql);
 			if (myerr >= 2000) {
+				if (myerr == 2019) {
+					client_myds->myconn->options.charset = mysql_thread___default_charset;
+				}
 				bool retry_conn=false;
 				// client error, serious
 				proxy_error("Detected a broken connection during SET NAMES on %s , %d : %d, %s\n", myconn->parent->address, myconn->parent->port, myerr, mysql_error(myconn->mysql));
@@ -1993,7 +2050,28 @@ bool MySQL_Session::handler_again___status_CHANGING_AUTOCOMMIT(int *_rc) {
 	if (myds->mypolls==NULL) {
 		thread->mypolls.add(POLLIN|POLLOUT, mybe->server_myds->fd, mybe->server_myds, thread->curtime);
 	}
-	int rc=myconn->async_set_autocommit(myds->revents, autocommit);
+	bool ac = autocommit;
+	if (autocommit == false) { // also IsAutoCommit==false
+		if (mysql_thread___enforce_autocommit_on_reads == false) {
+			if (mybe->server_myds->myconn->IsAutoCommit() == false) {
+				if (mybe->server_myds->myconn->IsActiveTransaction() == false) {
+					if (CurrentQuery.is_select_NOT_for_update()==true) {
+						// client wants autocommit=0
+						// enforce_autocommit_on_reads=false
+						// there is no transaction
+						// this seems to be the first query, and a SELECT not FOR UPDATE
+						// we will switch back to autcommit=1
+						ac = true;
+					}
+				} else {
+					st=previous_status.top();
+					previous_status.pop();
+					NEXT_IMMEDIATE_NEW(st);
+				}
+			}
+		}
+	}
+	int rc=myconn->async_set_autocommit(myds->revents, ac);
 	if (rc==0) {
 		st=previous_status.top();
 		previous_status.pop();
@@ -2049,8 +2127,9 @@ int MySQL_Session::handler() {
 	unsigned int j;
 	unsigned char c;
 
-	active_transactions=NumActiveTransactions();
-
+	if (active_transactions <= 0) {
+		active_transactions=NumActiveTransactions();
+	}
 //	FIXME: Sessions without frontend are an ugly hack
 	if (session_fast_forward==false) {
 	if (client_myds==NULL) {
@@ -2263,6 +2342,14 @@ __get_pkts_from_client:
 
 									proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Received query to be processed with MariaDB Client library\n");
 									mybe->server_myds->killed_at=0;
+									mybe->server_myds->kill_type=0;
+									if (GloMyLdapAuth) {
+										if (session_type==PROXYSQL_SESSION_MYSQL) {
+											if (mysql_thread___add_ldap_user_comment && strlen(mysql_thread___add_ldap_user_comment)) {
+												add_ldap_comment_to_pkt(&pkt);
+											}
+										}
+									}
 									mybe->server_myds->mysql_real_query.init(&pkt);
 									client_myds->setDSS_STATE_QUERY_SENT_NET();
 								} else {
@@ -2343,7 +2430,7 @@ __get_pkts_from_client:
 								if (session_type != PROXYSQL_SESSION_MYSQL) { // only MySQL module supports prepared statement!!
 									l_free(pkt.size,pkt.ptr);
 									client_myds->setDSS_STATE_QUERY_SENT_NET();
-									client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Command not supported");
+									client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Command not supported");
 									client_myds->DSS=STATE_SLEEP;
 									status=WAITING_CLIENT_DATA;
 									break;
@@ -2392,6 +2479,7 @@ __get_pkts_from_client:
 										mybe->server_myds->wait_until=0;
 										pause_until=0;
 										mybe->server_myds->killed_at=0;
+										mybe->server_myds->kill_type=0;
 										mybe->server_myds->mysql_real_query.init(&pkt); // fix memory leak for PREPARE in prepared statements #796
 										client_myds->setDSS_STATE_QUERY_SENT_NET();
 									}
@@ -2403,7 +2491,7 @@ __get_pkts_from_client:
 								if (session_type != PROXYSQL_SESSION_MYSQL) { // only MySQL module supports prepared statement!!
 									l_free(pkt.size,pkt.ptr);
 									client_myds->setDSS_STATE_QUERY_SENT_NET();
-									client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Command not supported");
+									client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Command not supported");
 									client_myds->DSS=STATE_SLEEP;
 									status=WAITING_CLIENT_DATA;
 									break;
@@ -2429,7 +2517,7 @@ __get_pkts_from_client:
 										// we couldn't find it
 										l_free(pkt.size,pkt.ptr);
 										client_myds->setDSS_STATE_QUERY_SENT_NET();
-										client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Prepared statement doesn't exist", true);
+										client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Prepared statement doesn't exist", true);
 										client_myds->DSS=STATE_SLEEP;
 										status=WAITING_CLIENT_DATA;
 										break;
@@ -2447,7 +2535,7 @@ __get_pkts_from_client:
 									if (stmt_meta==NULL) {
 										l_free(pkt.size,pkt.ptr);
 										client_myds->setDSS_STATE_QUERY_SENT_NET();
-										client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Error in prepared statement execution", true);
+										client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Error in prepared statement execution", true);
 										client_myds->DSS=STATE_SLEEP;
 										status=WAITING_CLIENT_DATA;
 										//__sync_fetch_and_sub(&stmt_info->ref_count,1); // decrease reference count
@@ -2471,6 +2559,7 @@ __get_pkts_from_client:
 									mybe->server_myds->connect_retries_on_failure=mysql_thread___connect_retries_on_failure;
 									mybe->server_myds->wait_until=0;
 									mybe->server_myds->killed_at=0;
+									mybe->server_myds->kill_type=0;
 									client_myds->setDSS_STATE_QUERY_SENT_NET();
 								}
 								break;
@@ -2805,6 +2894,9 @@ handler_again:
 						if (myconn->mysql->affected_rows) {
 							if (myconn->mysql->affected_rows != ULLONG_MAX) {
 								last_HG_affected_rows = current_hostgroup;
+								if (mysql_thread___auto_increment_delay_multiplex) {
+									myconn->auto_increment_delay_token = mysql_thread___auto_increment_delay_multiplex + 1;
+								}
 							}
 						}
 					}
@@ -2882,6 +2974,7 @@ handler_again:
 					}
 
 					RequestEnd(myds);
+					myds->myconn->reduce_auto_increment_delay_token();
 					if (mysql_thread___multiplexing && (myds->myconn->reusable==true) && myds->myconn->IsActiveTransaction()==false && myds->myconn->MultiplexDisabled()==false) {
 						if (mysql_thread___connection_delay_multiplex_ms && mirror==false) {
 							myds->wait_until=thread->curtime+mysql_thread___connection_delay_multiplex_ms*1000;
@@ -3039,6 +3132,7 @@ handler_again:
 							} else {
 								proxy_warning("Error during query on (%d,%s,%d): %d, %s\n", myconn->parent->myhgc->hid, myconn->parent->address, myconn->parent->port, myerr, ( errmsg ? errmsg : mysql_error(myconn->mysql)));
 							}
+							MyHGM->add_mysql_errors(myconn->parent->myhgc->hid, myconn->parent->address, myconn->parent->port, client_myds->myconn->userinfo->username, (client_myds->addr.addr ? client_myds->addr.addr : (char *)"unknown" ), client_myds->myconn->userinfo->schemaname, myerr, (char *)( errmsg ? errmsg : mysql_error(myconn->mysql)));
 							bool retry_conn=false;
 							switch (myerr) {
 								case 1317:  // Query execution was interrupted
@@ -3151,6 +3245,7 @@ handler_again:
 							}
 							RequestEnd(myds);
 							if (myds->myconn) {
+								myds->myconn->reduce_auto_increment_delay_token();
 								if (mysql_thread___multiplexing && (myds->myconn->reusable==true) && myds->myconn->IsActiveTransaction()==false && myds->myconn->MultiplexDisabled()==false) {
 									myds->DSS=STATE_NOT_INITIALIZED;
 									if (mysql_thread___autocommit_false_not_reusable && myds->myconn->IsAutoCommit()==false) {
@@ -3184,6 +3279,7 @@ handler_again:
 										if (myconn->MyRS_reuse) {
 											delete myconn->MyRS_reuse;
 										}
+										myconn->MyRS->reset_pid = false;
 										myconn->MyRS_reuse = myconn->MyRS;
 										myconn->MyRS=NULL;
 									}
@@ -3418,14 +3514,22 @@ void MySQL_Session::handler___status_CHANGING_USER_CLIENT___STATE_CLIENT_HANDSHA
 		}
 		char *_s=(char *)malloc(strlen(client_myds->myconn->userinfo->username)+100+strlen(client_addr));
 		sprintf(_s,"ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
+		proxy_error("ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
 		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,2,1045,(char *)"28000", _s, true);
 		free(_s);
+		__sync_fetch_and_add(&MyHGM->status.access_denied_wrong_password, 1);
 	}
 }
 
 void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(PtrSize_t *pkt, bool *wrong_pass) {
 	bool is_encrypted = client_myds->encrypted;
 	bool handshake_response_return = client_myds->myprot.process_pkt_handshake_response((unsigned char *)pkt->ptr,pkt->size);
+
+	if (
+		(handshake_response_return == false) && (client_myds->switching_auth_stage == 1)
+	) {
+		return;
+	}
 	
 	if (
 		(is_encrypted == false) && // the connection was encrypted
@@ -3522,7 +3626,11 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 				switch (session_type) {
 					case PROXYSQL_SESSION_MYSQL:
 					case PROXYSQL_SESSION_SQLITE:
-						free_users=GloMyAuth->increase_frontend_user_connections(client_myds->myconn->userinfo->username, &used_users);
+						if (ldap_ctx==NULL) {
+							free_users=GloMyAuth->increase_frontend_user_connections(client_myds->myconn->userinfo->username, &used_users);
+						} else {
+							free_users=GloMyLdapAuth->increase_frontend_user_connections(client_myds->myconn->userinfo->username, &used_users);
+						}
 						break;
 #ifdef PROXYSQLCLICKHOUSE
 					case PROXYSQL_SESSION_CLICKHOUSE:
@@ -3540,10 +3648,14 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 				client_authenticated=false;
 				*wrong_pass=true;
 				client_myds->setDSS_STATE_QUERY_SENT_NET();
+				uint8_t _pid = 2;
+				if (client_myds->switching_auth_stage) _pid+=2;
 				if (max_connections_reached==true) {
 					proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Too many connections\n");
-					client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,2,1040,(char *)"08004", (char *)"Too many connections", true);
+					client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,_pid,1040,(char *)"08004", (char *)"Too many connections", true);
+					__sync_fetch_and_add(&MyHGM->status.access_denied_max_connections, 1);
 				} else { // see issue #794
+					__sync_fetch_and_add(&MyHGM->status.access_denied_max_user_connections, 1);
 					proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "User '%s' has exceeded the 'max_user_connections' resource (current value: %d)\n", client_myds->myconn->userinfo->username, used_users);
 					char *a=(char *)"User '%s' has exceeded the 'max_user_connections' resource (current value: %d)";
 					char *b=(char *)malloc(strlen(a)+strlen(client_myds->myconn->userinfo->username)+16);
@@ -3593,6 +3705,9 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 					} else {
 						client_addr = strdup((char *)"");
 					}
+					uint8_t _pid = 2;
+					if (client_myds->switching_auth_stage) _pid+=2;
+					if (is_encrypted) _pid++;
 					if (
 						(strcmp(client_addr,(char *)"127.0.0.1")==0)
 						||
@@ -3601,30 +3716,38 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 						(strcmp(client_addr,(char *)"::1")==0)
 					) {
 						// we are good!
-						client_myds->myprot.generate_pkt_OK(true,NULL,NULL, (is_encrypted ? 3 : 2), 0,0,0,0,NULL);
+						//client_myds->myprot.generate_pkt_OK(true,NULL,NULL, (is_encrypted ? 3 : 2), 0,0,0,0,NULL);
+						client_myds->myprot.generate_pkt_OK(true,NULL,NULL, _pid, 0,0,0,0,NULL);
 						status=WAITING_CLIENT_DATA;
 						client_myds->DSS=STATE_CLIENT_AUTH_OK;
 					} else {
 						char *a=(char *)"User '%s' can only connect locally";
 						char *b=(char *)malloc(strlen(a)+strlen(client_myds->myconn->userinfo->username));
 						sprintf(b,a,client_myds->myconn->userinfo->username);
-						client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, (is_encrypted ? 3 : 2), 1040,(char *)"42000", b, true);
+						//client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, (is_encrypted ? 3 : 2), 1040,(char *)"42000", b, true);
+						client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, _pid, 1040,(char *)"42000", b, true);
 						free(b);
 					}
 					free(addr);
 					free(client_addr);
 				} else {
+					uint8_t _pid = 2;
+					if (client_myds->switching_auth_stage) _pid+=2;
+					if (is_encrypted) _pid++;
 					if (use_ssl == true && is_encrypted == false) {
 						*wrong_pass=true;
 						char *_a=(char *)"ProxySQL Error: Access denied for user '%s' (using password: %s). SSL is required";
 						char *_s=(char *)malloc(strlen(_a)+strlen(client_myds->myconn->userinfo->username)+32);
 						sprintf(_s, _a, client_myds->myconn->userinfo->username, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
-						client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, (is_encrypted ? 3 : 2), 1045,(char *)"28000", _s, true);
+						client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, _pid, 1045,(char *)"28000", _s, true);
+						proxy_error("ProxySQL Error: Access denied for user '%s' (using password: %s). SSL is required", client_myds->myconn->userinfo->username, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
 						__sync_add_and_fetch(&MyHGM->status.client_connections_aborted,1);
 						free(_s);
+						__sync_fetch_and_add(&MyHGM->status.access_denied_wrong_password, 1);
 					} else {
 						// we are good!
-						client_myds->myprot.generate_pkt_OK(true,NULL,NULL, (is_encrypted ? 3 : 2), 0,0,0,0,NULL);
+						//client_myds->myprot.generate_pkt_OK(true,NULL,NULL, (is_encrypted ? 3 : 2), 0,0,0,0,NULL);
+						client_myds->myprot.generate_pkt_OK(true,NULL,NULL, _pid, 0,0,0,0,NULL);
 						status=WAITING_CLIENT_DATA;
 						client_myds->DSS=STATE_CLIENT_AUTH_OK;
 					}
@@ -3650,7 +3773,7 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 		// FIXME: this should become close connection
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
 		char *client_addr=NULL;
-		if (client_myds->client_addr) {
+		if (client_myds->client_addr && client_myds->myconn->userinfo->username) {
 			char buf[512];
 			switch (client_myds->client_addr->sa_family) {
 				case AF_INET: {
@@ -3676,14 +3799,19 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(
 		} else {
 			client_addr = strdup((char *)"");
 		}
-		//if (client_myds->encrypted == false) {
-		char *_s=(char *)malloc(strlen(client_myds->myconn->userinfo->username)+100+strlen(client_addr));
-		sprintf(_s,"ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
-		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, (is_encrypted ? 3 : 2), 1045,(char *)"28000", _s, true);
+		if (client_myds->myconn->userinfo->username) {
+			char *_s=(char *)malloc(strlen(client_myds->myconn->userinfo->username)+100+strlen(client_addr));
+			uint8_t _pid = 2;
+			if (client_myds->switching_auth_stage) _pid+=2;
+			if (is_encrypted) _pid++;
+			sprintf(_s,"ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
+			client_myds->myprot.generate_pkt_ERR(true,NULL,NULL, _pid, 1045,(char *)"28000", _s, true);
+			proxy_error("ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)\n", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
+			free(_s);
+			__sync_fetch_and_add(&MyHGM->status.access_denied_wrong_password, 1);
+		}
 		__sync_add_and_fetch(&MyHGM->status.client_connections_aborted,1);
-		free(_s);
 		client_myds->DSS=STATE_SLEEP;
-		//}
 	}
 }
 
@@ -3742,12 +3870,12 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		/* FIXME: temporary */
 		l_free(pkt->size,pkt->ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Command not supported", true);
+		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Command not supported", true);
 		client_myds->DSS=STATE_SLEEP;
 	} else {
 		l_free(pkt->size,pkt->ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Command not supported", true);
+		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Command not supported", true);
 		client_myds->DSS=STATE_SLEEP;
 	}
 }
@@ -3762,7 +3890,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	} else {
 		l_free(pkt->size,pkt->ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Command not supported");
+		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Command not supported");
 		client_myds->DSS=STATE_SLEEP;
 	}
 }
@@ -3776,7 +3904,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	} else {
 		l_free(pkt->size,pkt->ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"#28000",(char *)"Command not supported");
+		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1045,(char *)"28000",(char *)"Command not supported");
 		client_myds->DSS=STATE_SLEEP;
 	}
 }
@@ -3784,7 +3912,7 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_PROCESS_KILL(PtrSize_t *pkt) {
 	l_free(pkt->size,pkt->ptr);
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
-	client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,9003,(char *)"#28000",(char *)"Command not supported");
+	client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,9003,(char *)"28000",(char *)"Command not supported");
 	client_myds->DSS=STATE_SLEEP;
 }
 
@@ -3818,13 +3946,15 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	if (session_type == PROXYSQL_SESSION_MYSQL) {
 		__sync_fetch_and_add(&MyHGM->status.frontend_use_db, 1);
 		char *schemaname=strndup((char *)pkt->ptr+sizeof(mysql_hdr)+5,pkt->size-sizeof(mysql_hdr)-5);
-		char *schemanameptr=schemaname;
+		char *schemanameptr=trim_spaces_and_quotes_in_place(schemaname);
+/*
 		//remove leading spaces
 		while(isspace((unsigned char)*schemanameptr)) schemanameptr++;
 		// remove trailing semicolon , issue #915
 		if (schemanameptr[strlen(schemanameptr)-1]==';') {
 			schemanameptr[strlen(schemanameptr)-1]='\0';
 		}
+*/
 		// handle cases like "USE `schemaname`
 		if(schemanameptr[0]=='`' && schemanameptr[strlen(schemanameptr)-1]=='`') {
 			schemanameptr[strlen(schemanameptr)-1]='\0';
@@ -4119,6 +4249,40 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		return false;
 	}
 
+	// handle case #1797
+	if ((pkt->size==SELECT_CONNECTION_ID_LEN+5 && strncasecmp((char *)SELECT_CONNECTION_ID,(char *)pkt->ptr+5,pkt->size-5)==0)) {
+		char buf[32];
+		char buf2[32];
+		sprintf(buf,"%u",thread_session_id);
+		int l0=strlen("CONNECTION_ID()");
+		memcpy(buf2,(char *)pkt->ptr+5+SELECT_CONNECTION_ID_LEN-l0,l0);
+		buf2[l0]=0;
+		unsigned int nTrx=NumActiveTransactions();
+		uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
+		if (autocommit) setStatus += SERVER_STATUS_AUTOCOMMIT;
+		MySQL_Data_Stream *myds=client_myds;
+		MySQL_Protocol *myprot=&client_myds->myprot;
+		myds->DSS=STATE_QUERY_SENT_DS;
+		int sid=1;
+		myprot->generate_pkt_column_count(true,NULL,NULL,sid,1); sid++;
+		myprot->generate_pkt_field(true,NULL,NULL,sid,(char *)"",(char *)"",(char *)"",buf2,(char *)"",63,31,MYSQL_TYPE_LONGLONG,161,0,false,0,NULL); sid++;
+		myds->DSS=STATE_COLUMN_DEFINITION;
+		myprot->generate_pkt_EOF(true,NULL,NULL,sid,0, setStatus); sid++;
+		char **p=(char **)malloc(sizeof(char*)*1);
+		unsigned long *l=(unsigned long *)malloc(sizeof(unsigned long *)*1);
+		l[0]=strlen(buf);
+		p[0]=buf;
+		myprot->generate_pkt_row(true,NULL,NULL,sid,1,l,p); sid++;
+		myds->DSS=STATE_ROW;
+		myprot->generate_pkt_EOF(true,NULL,NULL,sid,0, setStatus); sid++;
+		myds->DSS=STATE_SLEEP;
+		l_free(pkt->size,pkt->ptr);
+		free(p);
+		free(l);
+		RequestEnd(NULL);
+		return true;
+	}
+
 	// handle case #1421 , about LAST_INSERT_ID
 	if (CurrentQuery.QueryParserArgs.digest_text) {
 		char *dig=CurrentQuery.QueryParserArgs.digest_text;
@@ -4151,6 +4315,10 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			) {
 				char buf[32];
 				sprintf(buf,"%llu",last_insert_id);
+				char buf2[32];
+				int l0=strlen("LAST_INSERT_ID()");
+				memcpy(buf2,(char *)pkt->ptr+5+SELECT_LAST_INSERT_ID_LEN-l0,l0);
+				buf2[l0]=0;
 				unsigned int nTrx=NumActiveTransactions();
 				uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
 				if (autocommit) setStatus += SERVER_STATUS_AUTOCOMMIT;
@@ -4159,7 +4327,7 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 				myds->DSS=STATE_QUERY_SENT_DS;
 				int sid=1;
 				myprot->generate_pkt_column_count(true,NULL,NULL,sid,1); sid++;
-				myprot->generate_pkt_field(true,NULL,NULL,sid,(char *)"",(char *)"",(char *)"",(char *)"LAST_INSERT_ID()",(char *)"",63,31,MYSQL_TYPE_LONGLONG,161,0,false,0,NULL); sid++;
+				myprot->generate_pkt_field(true,NULL,NULL,sid,(char *)"",(char *)"",(char *)"",buf2,(char *)"",63,31,MYSQL_TYPE_LONGLONG,161,0,false,0,NULL); sid++;
 				myds->DSS=STATE_COLUMN_DEFINITION;
 				myprot->generate_pkt_EOF(true,NULL,NULL,sid,0, setStatus); sid++;
 				char **p=(char **)malloc(sizeof(char*)*1);
@@ -4185,6 +4353,12 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		}
 	}
 
+	// handle command KILL #860
+	if (prepared == false) {
+		if (handle_command_query_kill(pkt)) {
+			return true;
+		}
+	}
 	if (qpo->cache_ttl>0) {
 		uint32_t resbuf=0;
 		unsigned char *aa=GloQC->get(
@@ -4238,7 +4412,11 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		reset();
 		init();
 		if (client_authenticated) {
-			GloMyAuth->decrease_frontend_user_connections(client_myds->myconn->userinfo->username);
+			if (ldap_ctx==NULL) {
+				GloMyAuth->decrease_frontend_user_connections(client_myds->myconn->userinfo->username);
+			} else {
+				GloMyLdapAuth->decrease_frontend_user_connections(client_myds->myconn->userinfo->username);
+			}
 		}
 		client_authenticated=false;
 		if (client_myds->myprot.process_pkt_COM_CHANGE_USER((unsigned char *)pkt->ptr, pkt->size)==true) {
@@ -4283,8 +4461,10 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			}
 			char *_s=(char *)malloc(strlen(client_myds->myconn->userinfo->username)+100+strlen(client_addr));
 			sprintf(_s,"ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
+			proxy_error("ProxySQL Error: Access denied for user '%s'@'%s' (using password: %s)", client_myds->myconn->userinfo->username, client_addr, (client_myds->myconn->userinfo->password ? "YES" : "NO"));
 			client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,2,1045,(char *)"28000", _s, true);
 			free(_s);
+			__sync_fetch_and_add(&MyHGM->status.access_denied_wrong_password, 1);
 		}
 	} else {
 		//FIXME: send an error message saying "not supported" or disconnect
@@ -4467,7 +4647,11 @@ void MySQL_Session::MySQL_Result_to_MySQL_wire(MYSQL *mysql, MySQL_ResultSet *My
 			char sqlstate[10];
 			sprintf(sqlstate,"%s",mysql_sqlstate(mysql));
 			if (_myds && _myds->killed_at) { // see case #750
-				client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,client_myds->pkt_sid+1,1907,sqlstate,(char *)"Query execution was interrupted, query_timeout exceeded");
+				if (_myds->kill_type == 0) {
+					client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,client_myds->pkt_sid+1,1907,sqlstate,(char *)"Query execution was interrupted, query_timeout exceeded");
+				} else {
+					client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,client_myds->pkt_sid+1,1317,sqlstate,(char *)"Query execution was interrupted");
+				}
 			} else {
 				client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,client_myds->pkt_sid+1,mysql_errno(mysql),sqlstate,mysql_error(mysql));
 			}
@@ -4511,7 +4695,7 @@ void MySQL_Session::SQLite3_to_MySQL(SQLite3_result *result, char *error, int af
 	} else { // no result set
 		if (error) {
 			// there was an error
-			myprot->generate_pkt_ERR(true,NULL,NULL,sid,1045,(char *)"#28000",error);
+			myprot->generate_pkt_ERR(true,NULL,NULL,sid,1045,(char *)"28000",error);
 		} else {
 			// no error, DML succeeded
 			unsigned int nTrx=NumActiveTransactions();
@@ -4714,4 +4898,90 @@ void MySQL_Session::create_new_session_and_reset_connection(MySQL_Data_Stream *_
 		thread->unregister_session(sess_idx);
 		delete new_sess;
 	}
+}
+
+bool MySQL_Session::handle_command_query_kill(PtrSize_t *pkt) {
+	unsigned char command_type=*((unsigned char *)pkt->ptr+sizeof(mysql_hdr));
+	if (CurrentQuery.QueryParserArgs.digest_text) {
+		if (command_type == _MYSQL_COM_QUERY) {
+			if (client_myds && client_myds->myconn) {
+				MySQL_Connection *mc = client_myds->myconn;
+				if (mc->userinfo && mc->userinfo->username) {
+					if (CurrentQuery.MyComQueryCmd == MYSQL_COM_QUERY_KILL) {
+						char *qu = mysql_query_strip_comments((char *)pkt->ptr+1+sizeof(mysql_hdr), pkt->size-1-sizeof(mysql_hdr));
+						string nq=string(qu,strlen(qu));
+						re2::RE2::Options *opt2=new re2::RE2::Options(RE2::Quiet);
+						opt2->set_case_sensitive(false);
+						char *pattern=(char *)"^KILL\\s+(CONNECTION |QUERY |)\\s*(\\d+)\\s*$";
+						re2::RE2 *re=new RE2(pattern, *opt2);
+						int id=0;
+						string tk;
+						int rc;
+						rc=RE2::FullMatch(nq, *re, &tk, &id);
+						delete re;
+						delete opt2;
+						proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 2, "filtered query= \"%s\"\n", qu);
+						free(qu);
+						if (id) {
+							int tki = -1;
+							if (tk.c_str()) {
+								if ((strlen(tk.c_str())==0) || (strcasecmp(tk.c_str(),"CONNECTION ")==0)) {
+									tki = 0;
+								} else {
+									if (strcasecmp(tk.c_str(),"QUERY ")==0) {
+										tki = 1;
+									}
+								}
+							}
+							if (tki >= 0) {
+								proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 2, "Killing %s %d\n", (tki == 0 ? "CONNECTION" : "QUERY") , id);
+								GloMTH->kill_connection_or_query( id, (tki == 0 ? false : true ),  mc->userinfo->username);
+								client_myds->DSS=STATE_QUERY_SENT_NET;
+								unsigned int nTrx=NumActiveTransactions();
+								uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
+								if (autocommit) setStatus= SERVER_STATUS_AUTOCOMMIT;
+								client_myds->myprot.generate_pkt_OK(true,NULL,NULL,1,0,0,setStatus,0,NULL);
+								client_myds->DSS=STATE_SLEEP;
+								status=WAITING_CLIENT_DATA;
+								l_free(pkt->size,pkt->ptr);
+								RequestEnd(NULL);
+								return true;
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return false;
+}
+
+void MySQL_Session::add_ldap_comment_to_pkt(PtrSize_t *_pkt) {
+	if (GloMyLdapAuth==NULL)
+		return;
+	if (ldap_ctx==NULL)
+		return;
+	if (client_myds==NULL || client_myds->myconn==NULL || client_myds->myconn->userinfo==NULL)
+		return;
+	if (client_myds->myconn->userinfo->fe_username==NULL)
+		return;
+	char *fe=client_myds->myconn->userinfo->fe_username;
+	char *a = (char *)" /* %s=%s */";
+	char *b = (char *)malloc(strlen(a)+strlen(fe)+strlen(mysql_thread___add_ldap_user_comment));
+	sprintf(b,a,mysql_thread___add_ldap_user_comment,fe);
+	PtrSize_t _new_pkt;
+	_new_pkt.ptr = malloc(strlen(b) + _pkt->size);
+	memcpy(_new_pkt.ptr , _pkt->ptr, 5);
+	unsigned char *_c=(unsigned char *)_new_pkt.ptr;
+	_c+=5;
+	// prefix comment
+	//memcpy(_c,b,strlen(b));
+	//_c+=strlen(b);
+	memcpy(_c, (char *)_pkt->ptr+5, _pkt->size-5);
+	// suffix comment
+	_c+=_pkt->size-5;
+	memcpy(_c,b,strlen(b));
+	l_free(_pkt->size,_pkt->ptr);
+	_pkt->size = _pkt->size + strlen(b);
+	_pkt->ptr = _new_pkt.ptr;
 }

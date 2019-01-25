@@ -34,7 +34,7 @@
 
 #define MYHGM_MYSQL_GROUP_REPLICATION_HOSTGROUPS "CREATE TABLE mysql_group_replication_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , backup_writer_hostgroup INT CHECK (backup_writer_hostgroup>=0 AND backup_writer_hostgroup<>writer_hostgroup) NOT NULL , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND backup_writer_hostgroup<>reader_hostgroup AND reader_hostgroup>0) , offline_hostgroup INT NOT NULL CHECK (offline_hostgroup<>writer_hostgroup AND offline_hostgroup<>reader_hostgroup AND backup_writer_hostgroup<>offline_hostgroup AND offline_hostgroup>=0) , active INT CHECK (active IN (0,1)) NOT NULL DEFAULT 1 , max_writers INT NOT NULL CHECK (max_writers >= 0) DEFAULT 1 , writer_is_also_reader INT CHECK (writer_is_also_reader IN (0,1)) NOT NULL DEFAULT 0 , max_transactions_behind INT CHECK (max_transactions_behind>=0) NOT NULL DEFAULT 0 , comment VARCHAR , UNIQUE (reader_hostgroup) , UNIQUE (offline_hostgroup) , UNIQUE (backup_writer_hostgroup))"
 
-#define MYHGM_MYSQL_GALERA_HOSTGROUPS "CREATE TABLE mysql_galera_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , backup_writer_hostgroup INT CHECK (backup_writer_hostgroup>=0 AND backup_writer_hostgroup<>writer_hostgroup) NOT NULL , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND backup_writer_hostgroup<>reader_hostgroup AND reader_hostgroup>0) , offline_hostgroup INT NOT NULL CHECK (offline_hostgroup<>writer_hostgroup AND offline_hostgroup<>reader_hostgroup AND backup_writer_hostgroup<>offline_hostgroup AND offline_hostgroup>=0) , active INT CHECK (active IN (0,1)) NOT NULL DEFAULT 1 , max_writers INT NOT NULL CHECK (max_writers >= 0) DEFAULT 1 , writer_is_also_reader INT CHECK (writer_is_also_reader IN (0,1)) NOT NULL DEFAULT 0 , max_transactions_behind INT CHECK (max_transactions_behind>=0) NOT NULL DEFAULT 0 , comment VARCHAR , UNIQUE (reader_hostgroup) , UNIQUE (offline_hostgroup) , UNIQUE (backup_writer_hostgroup))"
+#define MYHGM_MYSQL_GALERA_HOSTGROUPS "CREATE TABLE mysql_galera_hostgroups (writer_hostgroup INT CHECK (writer_hostgroup>=0) NOT NULL PRIMARY KEY , backup_writer_hostgroup INT CHECK (backup_writer_hostgroup>=0 AND backup_writer_hostgroup<>writer_hostgroup) NOT NULL , reader_hostgroup INT NOT NULL CHECK (reader_hostgroup<>writer_hostgroup AND backup_writer_hostgroup<>reader_hostgroup AND reader_hostgroup>0) , offline_hostgroup INT NOT NULL CHECK (offline_hostgroup<>writer_hostgroup AND offline_hostgroup<>reader_hostgroup AND backup_writer_hostgroup<>offline_hostgroup AND offline_hostgroup>=0) , active INT CHECK (active IN (0,1)) NOT NULL DEFAULT 1 , max_writers INT NOT NULL CHECK (max_writers >= 0) DEFAULT 1 , writer_is_also_reader INT CHECK (writer_is_also_reader IN (0,1,2)) NOT NULL DEFAULT 0 , max_transactions_behind INT CHECK (max_transactions_behind>=0) NOT NULL DEFAULT 0 , comment VARCHAR , UNIQUE (reader_hostgroup) , UNIQUE (offline_hostgroup) , UNIQUE (backup_writer_hostgroup))"
 
 typedef std::unordered_map<std::uint64_t, void *> umap_mysql_errors;
 
@@ -305,7 +305,7 @@ class MySrvConnList {
 	}
 	MySQL_Connection *remove(int);
 	MySQL_Connection * get_random_MyConn(MySQL_Session *sess, bool ff);
-	unsigned int conns_length();
+	unsigned int conns_length() { return conns->len; }
 	void drop_all_connections();
 	MySQL_Connection *index(unsigned int);
 };
@@ -364,12 +364,12 @@ class MySrvList {	// MySQL Server List
 	int find_idx(MySrvC *);
 	public:
 	PtrArray *servers;
-	unsigned int cnt();
+	unsigned int cnt() { return servers->len; }
 	MySrvList(MyHGC *);
 	~MySrvList();
 	void add(MySrvC *);
 	void remove(MySrvC *);
-	MySrvC * idx(unsigned int);
+	MySrvC * idx(unsigned int i) {return (MySrvC *)servers->index(i); }
 };
 
 class MyHGC {	// MySQL Host Group Container
@@ -393,15 +393,15 @@ class Group_Replication_Info {
 	int max_transactions_behind;
 	char *comment;
 	bool active;
-	bool writer_is_also_reader;
+	int writer_is_also_reader;
 	bool __active;
 	bool need_converge; // this is set to true on LOAD MYSQL SERVERS TO RUNTIME . This ensure that checks wil take an action
 	int current_num_writers;
 	int current_num_backup_writers;
 	int current_num_readers;
 	int current_num_offline;
-	Group_Replication_Info(int w, int b, int r, int o, int mw, int mtb, bool _a, bool _w, char *c);
-	bool update(int b, int r, int o, int mw, int mtb, bool _a, bool _w, char *c);
+	Group_Replication_Info(int w, int b, int r, int o, int mw, int mtb, bool _a, int _w, char *c);
+	bool update(int b, int r, int o, int mw, int mtb, bool _a, int _w, char *c);
 	~Group_Replication_Info();
 };
 
@@ -415,15 +415,15 @@ class Galera_Info {
 	int max_transactions_behind;
 	char *comment;
 	bool active;
-	bool writer_is_also_reader;
+	int writer_is_also_reader;
 	bool __active;
 	bool need_converge; // this is set to true on LOAD MYSQL SERVERS TO RUNTIME . This ensure that checks wil take an action
 	int current_num_writers;
 	int current_num_backup_writers;
 	int current_num_readers;
 	int current_num_offline;
-	Galera_Info(int w, int b, int r, int o, int mw, int mtb, bool _a, bool _w, char *c);
-	bool update(int b, int r, int o, int mw, int mtb, bool _a, bool _w, char *c);
+	Galera_Info(int w, int b, int r, int o, int mw, int mtb, bool _a, int _w, char *c);
+	bool update(int b, int r, int o, int mw, int mtb, bool _a, int _w, char *c);
 	~Galera_Info();
 };
 
@@ -506,6 +506,9 @@ class MySQL_HostGroups_Manager {
 		unsigned long long frontend_init_db;
 		unsigned long long frontend_set_names;
 		unsigned long long frontend_use_db;
+		unsigned long long access_denied_wrong_password;
+		unsigned long long access_denied_max_connections;
+		unsigned long long access_denied_max_user_connections;
 	} status;
 	wqueue<MySQL_Connection *> queue;
 	MySQL_HostGroups_Manager();
@@ -564,8 +567,8 @@ class MySQL_HostGroups_Manager {
 	SQLite3_result *SQL3_Get_ConnPool_Stats();
 	void increase_reset_counter();
 
-	void add_mysql_errors(int hostgroup, char *hostname, int port, char *username, char *schemaname, int err_no, char *last_error);
-
+	void add_mysql_errors(int hostgroup, char *hostname, int port, char *username, char *address, char *schemaname, int err_no, char *last_error);
+	SQLite3_result *get_mysql_errors(bool);
 };
 
 #endif /* __CLASS_MYSQL_HOSTGROUPS_MANAGER_H */

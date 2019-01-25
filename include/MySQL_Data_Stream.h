@@ -26,10 +26,12 @@ class MyDS_real_query {
 	char *QueryPtr;	// pointer to beginning of the query
 	unsigned int QuerySize;	// size of the query
 	void init(PtrSize_t *_pkt) {
+/*
 		assert(QueryPtr==NULL);
 		assert(QuerySize==0);
 		assert(pkt.ptr==NULL);
 		assert(pkt.size==0);
+*/
 		pkt.ptr=_pkt->ptr;
 		pkt.size=_pkt->size;
 		QueryPtr=(char *)pkt.ptr+5;
@@ -126,7 +128,13 @@ class MySQL_Data_Stream
 	int active; // data stream is active. If not, shutdown+close needs to be called
 	int status; // status . FIXME: make it a ORable variable
 
+	int switching_auth_stage;
+	int switching_auth_type;
+	uint8_t tmp_charset;
+
 	short revents;
+
+	char kill_type;
 
 	bool encrypted;
 	bool net_failure;

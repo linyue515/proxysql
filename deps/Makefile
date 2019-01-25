@@ -85,6 +85,7 @@ jemalloc/jemalloc/lib/libjemalloc.a:
 	cd jemalloc && tar -jxf jemalloc-4.3.1.tar.bz2
 	cd jemalloc/jemalloc && patch src/jemalloc.c < ../issue823.patch
 	cd jemalloc/jemalloc && ./configure ${MYJEOPT}
+#	cd jemalloc/jemalloc && sed -i -e 's/-O3 /-O3 -fPIC /' Makefile
 	cd jemalloc/jemalloc && CC=${CC} CXX=${CXX} ${MAKE}
 
 jemalloc: jemalloc/jemalloc/lib/libjemalloc.a
@@ -95,6 +96,7 @@ mariadb-client-library/mariadb_client/libmariadb/libmariadbclient.a: libssl/open
 	cd mariadb-client-library && tar -zxf mariadb-connector-c-3.0.2-src.tar.gz
 	cd mariadb-client-library/mariadb_client && cmake . -DOPENSSL_ROOT_DIR=$(shell pwd)/libssl/openssl/ -DOPENSSL_LIBRARIES=$(shell pwd)/libssl/openssl/ .
 #	cd mariadb-client-library/mariadb_client && cmake . -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl # this is needed on MacOSX
+	cd mariadb-client-library/mariadb_client && patch libmariadb/mariadb_stmt.c < ../mariadb_stmt.c.patch
 	cd mariadb-client-library/mariadb_client && patch libmariadb/mariadb_lib.c < ../mariadb_lib.c.patch
 #	cd mariadb-client-library/mariadb_client && patch libmariadb/net.c < ../net.c.patch
 	cd mariadb-client-library/mariadb_client && patch libmariadb/mariadb_async.c < ../mariadb_async.c.patch
@@ -121,8 +123,8 @@ sqlite3/sqlite3/sqlite3.o:
 sqlite3: sqlite3/sqlite3/sqlite3.o
 
 libconfig/libconfig/lib/.libs/libconfig++.a:
-	cd libconfig && rm -rf libconfig-1.4.9
-	cd libconfig && tar -zxf libconfig-1.4.9.tar.gz
+	cd libconfig && rm -rf libconfig-1.7.2
+	cd libconfig && tar -zxf libconfig-1.7.2.tar.gz
 	cd libconfig/libconfig && ./configure --disable-examples
 	cd libconfig/libconfig && CC=${CC} CXX=${CXX} ${MAKE}
 
@@ -170,5 +172,6 @@ cleanall:
 	cd google-coredumper && rm -rf google-coredumper || true
 	cd libev && rm -rf libev-4.24 || true
 	cd libssl && rm -rf openssl-1.1.0h || true
+	cd libconfig && rm -rf libconfig-1.7.2 || true
 .PHONY: cleanall
 

@@ -83,6 +83,7 @@ class ProxySQL_Admin {
 		char *telnet_stats_ifaces;
 		bool admin_read_only;
 		bool hash_passwords;
+		bool vacuum_stats;
 		char * admin_version;
 		char * cluster_username;
 		char * cluster_password;
@@ -133,6 +134,7 @@ class ProxySQL_Admin {
 	void __delete_inactive_users(enum cred_username_type usertype);
 	void add_admin_users();
 	void __refresh_users();
+	void __add_active_users_ldap();
 
 	void flush_mysql_variables___runtime_to_database(SQLite3DB *db, bool replace, bool del, bool onlyifempty, bool runtime=false);
 	void flush_mysql_variables___database_to_runtime(SQLite3DB *db, bool replace);
@@ -166,6 +168,9 @@ class ProxySQL_Admin {
 	void flush_sqliteserver_variables___runtime_to_database(SQLite3DB *db, bool replace, bool del, bool onlyifempty, bool runtime=false);
 	void flush_sqliteserver_variables___database_to_runtime(SQLite3DB *db, bool replace);
 	
+	// LDAP
+	void flush_ldap_variables___runtime_to_database(SQLite3DB *db, bool replace, bool del, bool onlyifempty, bool runtime=false);
+	void flush_ldap_variables___database_to_runtime(SQLite3DB *db, bool replace);
 
 	public:
 	pthread_mutex_t sql_query_global_mutex;
@@ -191,6 +196,7 @@ class ProxySQL_Admin {
 	int pipefd[2];
 	void print_version();
 	bool init();
+	void init_ldap();
 	bool get_read_only() { return variables.admin_read_only; }
 	bool set_read_only(bool ro) { variables.admin_read_only=ro; return variables.admin_read_only; }
 	bool has_variable(const char *name);
@@ -255,7 +261,7 @@ class ProxySQL_Admin {
 	int Read_ProxySQL_Servers_from_configfile();
 
 	void flush_error_log();
-	void GenericRefreshStatistics(const char *query_no_space, unsigned int query_no_space_length, bool admin);
+	bool GenericRefreshStatistics(const char *query_no_space, unsigned int query_no_space_length, bool admin);
 	SQLite3_result * generate_show_table_status(const char *, char **err);
 	SQLite3_result * generate_show_fields_from(const char *tablename, char **err);
 
@@ -276,6 +282,12 @@ class ProxySQL_Admin {
 	void save_proxysql_servers_runtime_to_database(bool);
 	void dump_checksums_values_table();
 
+	// LDAP
+	void init_ldap_variables();
+	void load_ldap_variables_to_runtime() { flush_ldap_variables___database_to_runtime(admindb, true); }
+	void save_ldap_variables_from_runtime() { flush_ldap_variables___runtime_to_database(admindb, true, true, false); }
+	void save_mysql_ldap_mapping_runtime_to_database(bool);
+
 	// SQLite Server
 	void init_sqliteserver_variables();
 	void load_sqliteserver_variables_to_runtime() { flush_sqliteserver_variables___database_to_runtime(admindb, true); }
@@ -294,5 +306,6 @@ class ProxySQL_Admin {
 	void save_clickhouse_users_runtime_to_database(bool _runtime);
 #endif /* PROXYSQLCLICKHOUSE */
 
+	void vacuum_stats(bool);
 };
 #endif /* __CLASS_PROXYSQL_ADMIN_H */

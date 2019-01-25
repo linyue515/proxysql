@@ -71,6 +71,10 @@ static void __dump_pkt(const char *func, unsigned char *_ptr, unsigned int len) 
 #define queue_destroy(_q) { \
 	if (_q.buffer) free(_q.buffer); \
 	_q.buffer=NULL; \
+	if (_q.pkt.ptr) { \
+		l_free(_q.pkt.size,_q.pkt.ptr); \
+		queueOUT.pkt.ptr=NULL; \
+	} \
 }
 
 #define queue_zero(_q) { \
@@ -179,6 +183,7 @@ MySQL_Data_Stream::MySQL_Data_Stream() {
 	max_connect_time=0;
 	wait_until=0;
 	pause_until=0;
+	kill_type=0;
 	connect_tries=0;
 	poll_fds_idx=-1;
 	resultset_length=0;
@@ -196,6 +201,8 @@ MySQL_Data_Stream::MySQL_Data_Stream() {
 	myconn=NULL;	// 20141011
 	DSS=STATE_NOT_CONNECTED;
 	encrypted=false;
+	switching_auth_stage = 0;
+	switching_auth_type = 0;
 	ssl=NULL;
 	rbio_ssl = NULL;
 	wbio_ssl = NULL;
@@ -806,7 +813,7 @@ int MySQL_Data_Stream::buffer2array() {
 					PSarrayIN->add(queueIN.pkt.ptr,queueIN.pkt.size);
 				} else {
 					// we append the packet at the end of the previous packet
-					memcpy(last_pkt->ptr+last_pkt->size, queue_r_ptr(queueIN) , queueIN.pkt.size);
+					memcpy((char *)last_pkt->ptr+last_pkt->size, queue_r_ptr(queueIN) , queueIN.pkt.size);
 					last_pkt->size += queueIN.pkt.size;
 					queue_r(queueIN, queueIN.pkt.size);
 

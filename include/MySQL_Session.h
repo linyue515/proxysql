@@ -113,6 +113,7 @@ class MySQL_Session
 	bool handler_again___status_CHANGING_AUTOCOMMIT(int *);
 	void init();
 	void reset();
+	void add_ldap_comment_to_pkt(PtrSize_t *);
 
 	//this pointer is always initialized inside handler().
 	// it is an attempt to start simplifying the complexing of handler()
@@ -182,6 +183,8 @@ class MySQL_Session
 
 	Session_Regex **match_regexes;
 
+	void *ldap_ctx;
+
 	MySQL_Session();
 	~MySQL_Session();
 
@@ -218,6 +221,7 @@ class MySQL_Session
 	void writeout();
 	void Memory_Stats();
 	void create_new_session_and_reset_connection(MySQL_Data_Stream *_myds);
+	bool handle_command_query_kill(PtrSize_t *);
 };
 
 #define KILL_QUERY       1

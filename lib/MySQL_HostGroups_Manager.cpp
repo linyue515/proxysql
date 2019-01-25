@@ -40,6 +40,108 @@ class MySrvC;
 class MySrvList;
 class MyHGC;
 
+/*
+class HGM_query_errors_stats {
+	public:
+	int hid;
+	char *hostname;
+	int port;
+	char *username;
+	char *schemaname;
+	int error_no;
+	unsigned int count_star;
+	time_t first_seen;
+	time_t last_seen;
+	char *last_error;
+	HGM_query_errors_stats(int _h, char *_hn, int _p, char *u, char *s, int e, char *le) {
+		hid=_h;
+		hostname=strdup(_hn);
+		port=_p;
+		username=strdup(u);
+		schemaname=strdup(s);
+		error_no=e;
+		last_error=strdup(le);
+		count_star=0;
+		first_seen=0;
+		last_seen=0;
+	}
+	void add_time(unsigned long long n, char *le) {
+		count_star++;
+		if (first_seen==0) {
+			first_seen=n;
+		}
+		last_seen=n;
+		if (strcmp(last_error,le)){
+			free(last_error);
+			last_error=strdup(le);
+		}
+	}
+	~HGM_query_errors_stats() {
+		if (hostname) {
+			free(hostname);
+			hostname=NULL;
+		}
+		if (username) {
+			free(username);
+			username=NULL;
+		}
+		if (schemaname) {
+			free(schemaname);
+			schemaname=NULL;
+		}
+		if (last_error) {
+			free(last_error);
+			last_error=NULL;
+		}
+	}
+	char **get_row() {
+		char buf[128];
+		char **pta=(char **)malloc(sizeof(char *)*10);
+		sprintf(buf,"%d",hid);
+		pta[0]=strdup(buf);
+		assert(hostname);
+		pta[1]=strdup(hostname);
+		sprintf(buf,"%d",port);
+		pta[2]=strdup(buf);
+		assert(username);
+		pta[3]=strdup(username);
+		assert(schemaname);
+		pta[4]=strdup(schemaname);
+		sprintf(buf,"%d",error_no);
+		pta[5]=strdup(buf);
+
+		sprintf(buf,"%u",count_star);
+		pta[6]=strdup(buf);
+
+		time_t __now;
+		time(&__now);
+		unsigned long long curtime=monotonic_time();
+		time_t seen_time;
+
+		seen_time= __now - curtime/1000000 + first_seen/1000000;
+		sprintf(buf,"%ld", seen_time);
+		pta[7]=strdup(buf);
+
+		seen_time= __now - curtime/1000000 + last_seen/1000000;
+		sprintf(buf,"%ld", seen_time);
+		pta[8]=strdup(buf);
+
+		assert(last_error);
+		pta[9]=strdup(last_error);
+		return pta;
+	}
+	void free_row(char **pta) {
+		int i;
+		for (i=0;i<10;i++) {
+			assert(pta[i]);
+			free(pta[i]);
+		}
+		free(pta);
+	}
+};
+
+*/
+
 //static struct ev_async * gtid_ev_async;
 
 static pthread_mutex_t ev_loop_mutex;
@@ -135,7 +237,7 @@ void connect_cb(EV_P_ ev_io *w, int revents) {
 		if ((getsockopt(w->fd, SOL_SOCKET, SO_ERROR, &optval, &optlen) == -1) ||
 			(optval != 0)) {
 			/* Connection failed; try the next address in the list. */
-			int errnum = optval ? optval : errno;
+			//int errnum = optval ? optval : errno;
 			ev_io_stop(MyHGM->gtid_ev_loop, w);
 			close(w->fd);
 			MyHGM->gtid_missing_nodes = true;
@@ -170,7 +272,7 @@ void connect_cb(EV_P_ ev_io *w, int revents) {
 }
 
 struct ev_io * new_connector(char *address, uint16_t gtid_port, uint16_t mysql_port) {
-	struct sockaddr_in a;
+	//struct sockaddr_in a;
 	int s;
 
 	if ((s = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
@@ -638,9 +740,11 @@ MySQL_Connection * MySrvConnList::remove(int _k) {
 	return (MySQL_Connection *)conns->remove_index_fast(_k);
 }
 
+/*
 unsigned int MySrvConnList::conns_length() {
 	return conns->len;
 }
+*/
 
 MySrvConnList::MySrvConnList(MySrvC *_mysrvc) {
 	mysrvc=_mysrvc;
@@ -746,10 +850,16 @@ void MySrvC::connect_error(int err_num) {
 			break;
 	}
 	time_t t=time(NULL);
-	if (t!=time_last_detected_error) {
+	if (t > time_last_detected_error) {
 		time_last_detected_error=t;
 		connect_ERR_at_time_last_detected_error=1;
 	} else {
+		if (t < time_last_detected_error) {
+			// time_last_detected_error is in the future
+			// this means that monitor has a ping interval too big and tuned that in the future
+			return;
+		}
+		// same time
 		int max_failures = ( mysql_thread___shun_on_failures > mysql_thread___connect_retries_on_failure ? mysql_thread___connect_retries_on_failure : mysql_thread___shun_on_failures) ;
 		if (__sync_add_and_fetch(&connect_ERR_at_time_last_detected_error,1) >= (unsigned int)max_failures) {
 			bool _shu=false;
@@ -834,6 +944,9 @@ MySQL_HostGroups_Manager::MySQL_HostGroups_Manager() {
 	status.frontend_init_db=0;
 	status.frontend_set_names=0;
 	status.frontend_use_db=0;
+	status.access_denied_wrong_password=0;
+	status.access_denied_max_connections=0;
+	status.access_denied_max_user_connections=0;
 	pthread_mutex_init(&readonly_mutex, NULL);
 	pthread_mutex_init(&Group_Replication_Info_mutex, NULL);
 	pthread_mutex_init(&Galera_Info_mutex, NULL);
@@ -1747,12 +1860,12 @@ void MySQL_HostGroups_Manager::generate_mysql_group_replication_hostgroups_table
 		if (it2!=Group_Replication_Info_Map.end()) {
 			info=it2->second;
 			bool changed=false;
-			changed=info->update(backup_writer_hostgroup,reader_hostgroup,offline_hostgroup, max_writers, max_transactions_behind,  (bool)active, (bool)writer_is_also_reader, r->fields[8]);
+			changed=info->update(backup_writer_hostgroup,reader_hostgroup,offline_hostgroup, max_writers, max_transactions_behind,  (bool)active, writer_is_also_reader, r->fields[8]);
 			if (changed) {
 				//info->need_converge=true;
 			}
 		} else {
-			info=new Group_Replication_Info(writer_hostgroup,backup_writer_hostgroup,reader_hostgroup,offline_hostgroup, max_writers, max_transactions_behind,  (bool)active, (bool)writer_is_also_reader, r->fields[8]);
+			info=new Group_Replication_Info(writer_hostgroup,backup_writer_hostgroup,reader_hostgroup,offline_hostgroup, max_writers, max_transactions_behind,  (bool)active, writer_is_also_reader, r->fields[8]);
 			//info->need_converge=true;
 			Group_Replication_Info_Map.insert(Group_Replication_Info_Map.begin(), std::pair<int, Group_Replication_Info *>(writer_hostgroup,info));
 		}
@@ -1842,12 +1955,12 @@ void MySQL_HostGroups_Manager::generate_mysql_galera_hostgroups_table() {
 		if (it2!=Galera_Info_Map.end()) {
 			info=it2->second;
 			bool changed=false;
-			changed=info->update(backup_writer_hostgroup,reader_hostgroup,offline_hostgroup, max_writers, max_transactions_behind,  (bool)active, (bool)writer_is_also_reader, r->fields[8]);
+			changed=info->update(backup_writer_hostgroup,reader_hostgroup,offline_hostgroup, max_writers, max_transactions_behind,  (bool)active, writer_is_also_reader, r->fields[8]);
 			if (changed) {
 				//info->need_converge=true;
 			}
 		} else {
-			info=new Galera_Info(writer_hostgroup,backup_writer_hostgroup,reader_hostgroup,offline_hostgroup, max_writers, max_transactions_behind,  (bool)active, (bool)writer_is_also_reader, r->fields[8]);
+			info=new Galera_Info(writer_hostgroup,backup_writer_hostgroup,reader_hostgroup,offline_hostgroup, max_writers, max_transactions_behind,  (bool)active, writer_is_also_reader, r->fields[8]);
 			//info->need_converge=true;
 			Galera_Info_Map.insert(Galera_Info_Map.begin(), std::pair<int, Galera_Info *>(writer_hostgroup,info));
 		}
@@ -2074,7 +2187,7 @@ MySrvC *MyHGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid) {
 						if (max_wait_sec < 1) { // min wait time should be at least 1 second
 							max_wait_sec = 1;
 						}
-						if ((t - mysrvc->time_last_detected_error) > max_wait_sec) {
+						if (t > mysrvc->time_last_detected_error && (t - mysrvc->time_last_detected_error) > max_wait_sec) {
 							if (
 								(mysrvc->shunned_and_kill_all_connections==false) // it is safe to bring it back online
 								||
@@ -2109,7 +2222,7 @@ MySrvC *MyHGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid) {
 			// most of the follow code is copied from few lines above
 			time_t t;
 			t=time(NULL);
-			int max_wait_sec = ( mysql_thread___shun_recovery_time_sec * 1000 >= mysql_thread___connect_timeout_server_max ? mysql_thread___connect_timeout_server_max/100 - 1 : mysql_thread___shun_recovery_time_sec/10 );
+			int max_wait_sec = ( mysql_thread___shun_recovery_time_sec * 1000 >= mysql_thread___connect_timeout_server_max ? mysql_thread___connect_timeout_server_max/10000 - 1 : mysql_thread___shun_recovery_time_sec/10 );
 			if (max_wait_sec < 1) { // min wait time should be at least 1 second
 				max_wait_sec = 1;
 			}
@@ -2211,11 +2324,11 @@ MySrvC *MyHGC::get_random_MySrvC(char * gtid_uuid, uint64_t gtid_trxid) {
 	return NULL; // if we reach here, we couldn't find any target
 }
 
-unsigned int MySrvList::cnt() {
-	return servers->len;
-}
+//unsigned int MySrvList::cnt() {
+//	return servers->len;
+//}
 
-MySrvC * MySrvList::idx(unsigned int i) { return (MySrvC *)servers->index(i); }
+//MySrvC * MySrvList::idx(unsigned int i) { return (MySrvC *)servers->index(i); }
 
 MySQL_Connection * MySrvConnList::get_random_MyConn(MySQL_Session *sess, bool ff) {
 	MySQL_Connection * conn=NULL;
@@ -2228,13 +2341,14 @@ MySQL_Connection * MySrvConnList::get_random_MyConn(MySQL_Session *sess, bool ff
 			i=fastrand()%l;
 		}
 		if (sess && sess->client_myds && sess->client_myds->myconn && sess->client_myds->myconn->userinfo) {
-			// try to match schemaname
+			// try to match schemaname AND username
 			char *schema = sess->client_myds->myconn->userinfo->schemaname;
+			char *username = sess->client_myds->myconn->userinfo->username;
 			bool conn_found = false;
 			unsigned int k;
 			for (k = i; conn_found == false && k < l; k++) {
 				conn = (MySQL_Connection *)conns->index(k);
-				if (strcmp(conn->userinfo->schemaname,schema)==0) {
+				if (strcmp(conn->userinfo->schemaname,schema)==0 && strcmp(conn->userinfo->username,username)==0) {
 					conn_found = true;
 					i = k;
 				}
@@ -2242,7 +2356,7 @@ MySQL_Connection * MySrvConnList::get_random_MyConn(MySQL_Session *sess, bool ff
 			if (conn_found == false ) {
 				for (k = 0; conn_found == false && k < i; k++) {
 					conn = (MySQL_Connection *)conns->index(k);
-					if (strcmp(conn->userinfo->schemaname,schema)==0) {
+					if (strcmp(conn->userinfo->schemaname,schema)==0 && strcmp(conn->userinfo->username,username)==0) {
 						conn_found = true;
 						i = k;
 					}
@@ -2340,7 +2454,10 @@ void MySQL_HostGroups_Manager::destroy_MyConn_from_pool(MySQL_Connection *c, boo
 				pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 				pthread_attr_setstacksize (&attr, 256*1024);
 				pthread_t pt;
-				pthread_create(&pt, &attr, &kill_query_thread, ka);
+				if (pthread_create(&pt, &attr, &kill_query_thread, ka) != 0) {
+					proxy_error("Thread creation\n");
+					assert(0);
+				}
 			}
 		}
 	}
@@ -2381,7 +2498,7 @@ void MySQL_HostGroups_Manager::replication_lag_action(int _hid, char *address, u
 //						||
 						(current_replication_lag>=0 && ((unsigned int)current_replication_lag > mysrvc->max_replication_lag))
 					) {
-						proxy_warning("Shunning server %s:%d with replication lag of %d second\n", address, port, current_replication_lag);
+						proxy_warning("Shunning server %s:%d from HG %u with replication lag of %d second\n", address, port, myhgc->hid, current_replication_lag);
 						mysrvc->status=MYSQL_SERVER_STATUS_SHUNNED_REPLICATION_LAG;
 					}
 				} else {
@@ -2392,7 +2509,7 @@ void MySQL_HostGroups_Manager::replication_lag_action(int _hid, char *address, u
 							(current_replication_lag==-2) // see issue 959
 						) {
 							mysrvc->status=MYSQL_SERVER_STATUS_ONLINE;
-							proxy_warning("Re-enabling server %s:%d with replication lag of %d second\n", address, port, current_replication_lag);
+							proxy_warning("Re-enabling server %s:%d from HG %u with replication lag of %d second\n", address, port, myhgc->hid, current_replication_lag);
 						}
 					}
 				}
@@ -2480,7 +2597,7 @@ int MySQL_HostGroups_Manager::get_multiple_idle_connections(int _hid, unsigned l
 			for (k=0; k<(int)mscl->conns_length(); k++) {
 				MySQL_Connection *mc=mscl->index(k);
 				// If the connection is idle ...
-				if (mc->last_time_used < _max_last_time_used) {
+				if (mc->last_time_used && mc->last_time_used < _max_last_time_used) {
 					//mc=(MySQL_Connection *)pa->remove_index_fast(k);
 					mc=mscl->remove(k);
 					mysrvc->ConnectionsUsed->add(mc);
@@ -2983,6 +3100,18 @@ bool MySQL_HostGroups_Manager::shun_and_killall(char *hostname, int port) {
 						default:
 							break;
 					}
+					// if Monitor is enabled and mysql-monitor_ping_interval is
+					// set too high, ProxySQL will unshun hosts that are not
+					// available. For this reason time_last_detected_error will
+					// be tuned in the future
+					if (mysql_thread___monitor_enabled) {
+						int a = mysql_thread___shun_recovery_time_sec;
+						int b = mysql_thread___monitor_ping_interval;
+						b = b/1000;
+						if (b > a) {
+							t = t + (b - a);
+						}
+					}
 					mysrvc->time_last_detected_error = t;
 				}
 			}
@@ -3095,7 +3224,7 @@ unsigned long long MySQL_HostGroups_Manager::Get_Memory_Stats() {
 	return intsize;
 }
 
-Group_Replication_Info::Group_Replication_Info(int w, int b, int r, int o, int mw, int mtb, bool _a, bool _w, char *c) {
+Group_Replication_Info::Group_Replication_Info(int w, int b, int r, int o, int mw, int mtb, bool _a, int _w, char *c) {
 	comment=NULL;
 	if (c) {
 		comment=strdup(c);
@@ -3123,7 +3252,7 @@ Group_Replication_Info::~Group_Replication_Info() {
 	}
 }
 
-bool Group_Replication_Info::update(int b, int r, int o, int mw, int mtb, bool _a, bool _w, char *c) {
+bool Group_Replication_Info::update(int b, int r, int o, int mw, int mtb, bool _a, int _w, char *c) {
 	bool ret=false;
 	__active=true;
 	if (backup_writer_hostgroup!=b) {
@@ -3342,7 +3471,7 @@ void MySQL_HostGroups_Manager::update_group_replication_set_writer(char *_hostna
 	}
 	free(query);
 
-	bool writer_is_also_reader=false;
+	int writer_is_also_reader=0;
 	bool found_writer=false;
 	bool found_reader=false;
 	int read_HG=-1;
@@ -3378,7 +3507,11 @@ void MySQL_HostGroups_Manager::update_group_replication_set_writer(char *_hostna
 		}
 		if (need_converge==false) {
 			if (found_writer) { // maybe no-op
-				if (writer_is_also_reader==found_reader) { // either both true or both false
+				if (
+					(writer_is_also_reader==0 && found_reader==false)
+					||
+					(writer_is_also_reader > 0 && found_reader==true)
+				) { // either both true or both false
 					delete resultset;
 					resultset=NULL;
 				}
@@ -3542,13 +3675,51 @@ void MySQL_HostGroups_Manager::converge_group_replication_config(int _writer_hos
 			delete resultset;
 			resultset=NULL;
 		}
+		if (info->writer_is_also_reader==2) {
+			q=(char *)"SELECT hostgroup_id,hostname,port FROM mysql_servers_incoming WHERE status=0 AND hostgroup_id IN (%d, %d, %d, %d) ORDER BY weight DESC, hostname DESC";
+			query=(char *)malloc(strlen(q)+256);
+			sprintf(query, q, info->writer_hostgroup, info->backup_writer_hostgroup, info->reader_hostgroup, info->offline_hostgroup);
+			mydb->execute_statement(query, &error, &cols , &affected_rows , &resultset);
+			free(query);
+			if (resultset) {
+				if (resultset->rows_count) {
+					int num_writers=0;
+					int num_backup_writers=0;
+					for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+						SQLite3_row *r=*it;
+						int hostgroup=atoi(r->fields[0]);
+						if (hostgroup==info->writer_hostgroup) {
+							num_writers++;
+						} else {
+							if (hostgroup==info->backup_writer_hostgroup) {
+								num_backup_writers++;
+							}
+						}
+					}
+					if (num_backup_writers) { // there are backup writers, only these will be used as readers
+						q=(char *)"DELETE FROM mysql_servers_incoming WHERE hostgroup_id=%d";
+						query=(char *)malloc(strlen(q) + 128);
+						sprintf(query,q, info->reader_hostgroup);
+						mydb->execute(query);
+						free(query);
+						q=(char *)"INSERT OR IGNORE INTO mysql_servers_incoming (hostgroup_id,hostname,port,gtid_port,status,weight,compression,max_connections,max_replication_lag,use_ssl,max_latency_ms,comment) SELECT %d,hostname,port,gtid_port,status,weight,compression,max_connections,max_replication_lag,use_ssl,max_latency_ms,comment FROM mysql_servers_incoming WHERE hostgroup_id=%d";
+						query=(char *)malloc(strlen(q) + 128);
+						sprintf(query,q, info->reader_hostgroup, info->backup_writer_hostgroup);
+						mydb->execute(query);
+						free(query);
+					}
+				}
+				delete resultset;
+				resultset=NULL;
+			}
+		}
 	} else {
 		// we couldn't find the cluster, exits
 	}
 	pthread_mutex_unlock(&Group_Replication_Info_mutex);
 }
 
-Galera_Info::Galera_Info(int w, int b, int r, int o, int mw, int mtb, bool _a, bool _w, char *c) {
+Galera_Info::Galera_Info(int w, int b, int r, int o, int mw, int mtb, bool _a, int _w, char *c) {
 	comment=NULL;
 	if (c) {
 		comment=strdup(c);
@@ -3576,7 +3747,7 @@ Galera_Info::~Galera_Info() {
 	}
 }
 
-bool Galera_Info::update(int b, int r, int o, int mw, int mtb, bool _a, bool _w, char *c) {
+bool Galera_Info::update(int b, int r, int o, int mw, int mtb, bool _a, int _w, char *c) {
 	bool ret=false;
 	__active=true;
 	if (backup_writer_hostgroup!=b) {
@@ -3650,8 +3821,8 @@ void MySQL_HostGroups_Manager::update_galera_set_offline(char *_hostname, int _p
 		} else { // the server is already offline, but we check if needs to be taken back online
 			SQLite3_result *numw_result = NULL;
 			q=(char *)"SELECT 1 FROM mysql_servers WHERE hostgroup_id=%d AND status=0";
-			query=(char *)malloc(strlen(q)+strlen(_hostname)+32);
-			sprintf(query,q,_hostname,_port);
+			query=(char *)malloc(strlen(q) + (sizeof(_writer_hostgroup) * 8 + 1));
+			sprintf(query,q,_writer_hostgroup);
 			mydb->execute_statement(query, &error , &cols , &affected_rows , &numw_result);
 			free(query);
 			if (numw_result) {
@@ -3853,7 +4024,7 @@ void MySQL_HostGroups_Manager::update_galera_set_writer(char *_hostname, int _po
 	}
 	free(query);
 
-	bool writer_is_also_reader=false;
+	int writer_is_also_reader=0;
 	bool found_writer=false;
 	bool found_reader=false;
 	int read_HG=-1;
@@ -3914,7 +4085,11 @@ void MySQL_HostGroups_Manager::update_galera_set_writer(char *_hostname, int _po
 
 		if (need_converge==false) {
 			if (found_writer) { // maybe no-op
-				if (writer_is_also_reader==found_reader) { // either both true or both false
+				if (
+					(writer_is_also_reader==0 && found_reader==false)
+					||
+					(writer_is_also_reader > 0 && found_reader==true)
+				) { // either both true or both false
 					delete resultset;
 					resultset=NULL;
 				}
@@ -4178,7 +4353,7 @@ void MySQL_HostGroups_Manager::converge_galera_config(int _writer_hostgroup) {
 														sprintf(query,q,info->writer_hostgroup, info->writer_hostgroup, info->backup_writer_hostgroup, info->reader_hostgroup, info->offline_hostgroup, host.c_str(), port_n);
 														mydb->execute(query);
 														free(query);
-														bool writer_is_also_reader = info->writer_is_also_reader;
+														int writer_is_also_reader = info->writer_is_also_reader;
 														if (writer_is_also_reader) {
 															int read_HG = info->reader_hostgroup;
 															q=(char *)"INSERT OR IGNORE INTO mysql_servers_incoming (hostgroup_id,hostname,port,gtid_port,status,weight,compression,max_connections,max_replication_lag,use_ssl,max_latency_ms,comment) SELECT %d,hostname,port,gtid_port,status,weight,compression,max_connections,max_replication_lag,use_ssl,max_latency_ms,comment FROM mysql_servers_incoming WHERE hostgroup_id=%d AND hostname='%s' AND port=%d";
@@ -4204,6 +4379,44 @@ void MySQL_HostGroups_Manager::converge_galera_config(int _writer_hostgroup) {
 		if (resultset) {
 			delete resultset;
 			resultset=NULL;
+		}
+		if (info->writer_is_also_reader==2) {
+			q=(char *)"SELECT hostgroup_id,hostname,port FROM mysql_servers_incoming WHERE status=0 AND hostgroup_id IN (%d, %d, %d, %d) ORDER BY weight DESC, hostname DESC";
+			query=(char *)malloc(strlen(q)+256);
+			sprintf(query, q, info->writer_hostgroup, info->backup_writer_hostgroup, info->reader_hostgroup, info->offline_hostgroup);
+			mydb->execute_statement(query, &error, &cols , &affected_rows , &resultset);
+			free(query);
+			if (resultset) {
+				if (resultset->rows_count) {
+					int num_writers=0;
+					int num_backup_writers=0;
+					for (std::vector<SQLite3_row *>::iterator it = resultset->rows.begin() ; it != resultset->rows.end(); ++it) {
+						SQLite3_row *r=*it;
+						int hostgroup=atoi(r->fields[0]);
+						if (hostgroup==info->writer_hostgroup) {
+							num_writers++;
+						} else {
+							if (hostgroup==info->backup_writer_hostgroup) {
+								num_backup_writers++;
+							}
+						}
+					}
+					if (num_backup_writers) { // there are backup writers, only these will be used as readers
+						q=(char *)"DELETE FROM mysql_servers_incoming WHERE hostgroup_id=%d";
+						query=(char *)malloc(strlen(q) + 128);
+						sprintf(query,q, info->reader_hostgroup);
+						mydb->execute(query);
+						free(query);
+						q=(char *)"INSERT OR IGNORE INTO mysql_servers_incoming (hostgroup_id,hostname,port,gtid_port,status,weight,compression,max_connections,max_replication_lag,use_ssl,max_latency_ms,comment) SELECT %d,hostname,port,gtid_port,status,weight,compression,max_connections,max_replication_lag,use_ssl,max_latency_ms,comment FROM mysql_servers_incoming WHERE hostgroup_id=%d";
+						query=(char *)malloc(strlen(q) + 128);
+						sprintf(query,q, info->reader_hostgroup, info->backup_writer_hostgroup);
+						mydb->execute(query);
+						free(query);
+					}
+				}
+				delete resultset;
+				resultset=NULL;
+			}
 		}
 	} else {
 		// we couldn't find the cluster, exits
@@ -4232,7 +4445,7 @@ SQLite3_result * MySQL_HostGroups_Manager::get_stats_mysql_gtid_executed() {
 			//sprintf(buf,"%d", mysrvc->port);
 			string s1 = gtid_executed_to_string(gtid_si->gtid_executed);
 			pta[2]=strdup(s1.c_str());
-			sprintf(buf,"%llu", (int)gtid_si->events_read);
+			sprintf(buf,"%llu", gtid_si->events_read);
 			pta[3]=strdup(buf);
 		} else {
 			std::string s = it->first;
@@ -4264,13 +4477,14 @@ class MySQL_Errors_stats {
 	char *hostname;
 	int port;
 	char *username;
+	char *client_address;
 	char *schemaname;
 	int err_no;
 	char *last_error;
 	time_t first_seen;
 	time_t last_seen;
 	unsigned long long count_star;
-	MySQL_Errors_stats(int hostgroup_, char *hostname_, int port_, char *username_, char *schemaname_, int err_no_, char *last_error_, time_t tn) {
+	MySQL_Errors_stats(int hostgroup_, char *hostname_, int port_, char *username_, char *address_, char *schemaname_, int err_no_, char *last_error_, time_t tn) {
 		hostgroup = hostgroup_;
 		if (hostname_) {
 			hostname = strdup(hostname_);
@@ -4282,6 +4496,11 @@ class MySQL_Errors_stats {
 			username = strdup(username_);
 		} else {
 			username = strdup((char *)"");
+		}
+		if (address_) {
+			client_address = strdup(address_);
+		} else {
+			client_address = strdup((char *)"");
 		}
 		if (schemaname_) {
 			schemaname = strdup(schemaname_);
@@ -4298,9 +4517,88 @@ class MySQL_Errors_stats {
 		first_seen = tn;
 		count_star = 1;
 	}
+	~MySQL_Errors_stats() {
+		if (hostname) {
+			free(hostname);
+			hostname=NULL;
+		}
+		if (username) {
+			free(username);
+			username=NULL;
+		}
+		if (client_address) {
+			free(client_address);
+			client_address=NULL;
+		}
+		if (schemaname) {
+			free(schemaname);
+			schemaname=NULL;
+		}
+		if (last_error) {
+			free(last_error);
+			last_error=NULL;
+		}
+	}
+	char **get_row() {
+		char buf[128];
+		char **pta=(char **)malloc(sizeof(char *)*11);
+		sprintf(buf,"%d",hostgroup);
+		pta[0]=strdup(buf);
+		assert(hostname);
+		pta[1]=strdup(hostname);
+		sprintf(buf,"%d",port);
+		pta[2]=strdup(buf);
+		assert(username);
+		pta[3]=strdup(username);
+		assert(client_address);
+		pta[4]=strdup(client_address);
+		assert(schemaname);
+		pta[5]=strdup(schemaname);
+		sprintf(buf,"%d",err_no);
+		pta[6]=strdup(buf);
+
+		sprintf(buf,"%llu",count_star);
+		pta[7]=strdup(buf);
+
+		time_t __now;
+		time(&__now);
+		unsigned long long curtime=monotonic_time();
+		time_t seen_time;
+
+		seen_time= __now - curtime/1000000 + first_seen/1000000;
+		sprintf(buf,"%ld", seen_time);
+		pta[8]=strdup(buf);
+
+		seen_time= __now - curtime/1000000 + last_seen/1000000;
+		sprintf(buf,"%ld", seen_time);
+		pta[9]=strdup(buf);
+
+		assert(last_error);
+		pta[10]=strdup(last_error);
+		return pta;
+	}
+	void add_time(unsigned long long n, char *le) {
+		count_star++;
+		if (first_seen==0) {
+			first_seen=n;
+		}
+		last_seen=n;
+		if (strcmp(last_error,le)){
+			free(last_error);
+			last_error=strdup(le);
+		}
+	}
+	void free_row(char **pta) {
+		int i;
+		for (i=0;i<11;i++) {
+			assert(pta[i]);
+			free(pta[i]);
+		}
+		free(pta);
+	}
 };
 
-void MySQL_HostGroups_Manager::add_mysql_errors(int hostgroup, char *hostname, int port, char *username, char *schemaname, int err_no, char *last_error) {
+void MySQL_HostGroups_Manager::add_mysql_errors(int hostgroup, char *hostname, int port, char *username, char *address, char *schemaname, int err_no, char *last_error) {
 	SpookyHash myhash;
 	uint64_t hash1;
 	uint64_t hash2;
@@ -4319,6 +4617,10 @@ void MySQL_HostGroups_Manager::add_mysql_errors(int hostgroup, char *hostname, i
 		myhash.Update(username,strlen(username));
 	}
 	myhash.Update(rand_del,rand_del_len);
+	if (address) {
+		myhash.Update(address,strlen(address));
+	}
+	myhash.Update(rand_del,rand_del_len);
 	if (schemaname) {
 		myhash.Update(schemaname,strlen(schemaname));
 	}
@@ -4335,15 +4637,48 @@ void MySQL_HostGroups_Manager::add_mysql_errors(int hostgroup, char *hostname, i
 	if (it != mysql_errors_umap.end()) {
 		// found
 		mes=(MySQL_Errors_stats *)it->second;
+		mes->add_time(tn, last_error);
+/*
 		mes->last_seen = tn;
 		if (strcmp(mes->last_error,last_error)) {
 			free(mes->last_error);
 			mes->last_error = strdup(last_error);
 			mes->count_star++;
 		}
+*/
 	} else {
-		mes = new MySQL_Errors_stats(hostgroup, hostname, port, username, schemaname, err_no, last_error, tn);
+		mes = new MySQL_Errors_stats(hostgroup, hostname, port, username, address, schemaname, err_no, last_error, tn);
 		mysql_errors_umap.insert(std::make_pair(hash1,(void *)mes));
 	}
 	pthread_mutex_unlock(&mysql_errors_mutex);
+}
+
+SQLite3_result * MySQL_HostGroups_Manager::get_mysql_errors(bool reset) {
+	SQLite3_result *result=new SQLite3_result(11);
+	pthread_mutex_lock(&mysql_errors_mutex);
+	result->add_column_definition(SQLITE_TEXT,"hid");
+	result->add_column_definition(SQLITE_TEXT,"hostname");
+	result->add_column_definition(SQLITE_TEXT,"port");
+	result->add_column_definition(SQLITE_TEXT,"username");
+	result->add_column_definition(SQLITE_TEXT,"client_address");
+	result->add_column_definition(SQLITE_TEXT,"schemaname");
+	result->add_column_definition(SQLITE_TEXT,"err_no");
+	result->add_column_definition(SQLITE_TEXT,"count_star");
+	result->add_column_definition(SQLITE_TEXT,"first_seen");
+	result->add_column_definition(SQLITE_TEXT,"last_seen");
+	result->add_column_definition(SQLITE_TEXT,"last_error");
+	for (std::unordered_map<uint64_t, void *>::iterator it=mysql_errors_umap.begin(); it!=mysql_errors_umap.end(); ++it) {
+		MySQL_Errors_stats *mes=(MySQL_Errors_stats *)it->second;
+		char **pta=mes->get_row();
+		result->add_row(pta);
+		mes->free_row(pta);
+		if (reset) {
+			delete mes;
+		}
+	}
+	if (reset) {
+		mysql_errors_umap.erase(mysql_errors_umap.begin(),mysql_errors_umap.end());
+	}
+	pthread_mutex_unlock(&mysql_errors_mutex);
+	return result;
 }
